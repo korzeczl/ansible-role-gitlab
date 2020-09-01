@@ -1,0 +1,126 @@
+---
+# tasks file for provisioning/roles/gitlab-ce
+
+- name: Include OS-specific variables.
+  include_vars: "{{ ansible_os_family }}.yml"
+
+- name: Check if GitLab is already installed.
+  stat: path=/usr/bin/gitlab-ctl
+  register: gitlab_file
+
+- name: Calculate old gitlab.rb md5
+  stat: path="/etc/gitlab/gitlab.rb"
+  register: old_config_stat
+  when: gitlab_file.stat.exists
+
+- name: Add http service to firewalld
+  firewalld:
+    service: http
+    permanent: yes
+    state: enabled
+  notify:
+    - reload service firewalld
+
+- name: Add https service to firewalld
+  firewalld:
+    service: https
+    permanent: yes
+    state: enabled
+  notify:
+    - reload service firewalld
+
+- name: enable at boot and check sshd service is running
+  systemd:
+    name: sshd
+    state: started
+    enabled: yes
+
+# Install GitLab and its dependencies.
+- name: Install GitLab dependencies.
+  package:
+    name: "{{ gitlab_dependencies }}"
+    state: present
+
+- name: Download GitLab repository installation script.
+  get_url:
+    url: "{{ gitlab_repository_installation_script_url }}"
+    dest: /tmp/gitlab_install_repository.sh
+    validate_certs: "{{ gitlab_download_validate_certs }}"
+  when: not gitlab_file.stat.exists
+
+- name: Install GitLab repository.
+  command: bash /tmp/gitlab_install_repository.sh
+  register: output
+  when: not gitlab_file.stat.exists
+
+- name: Install GitLab
+  package:
+    name: "{{ gitlab_edition }}"
+    state: present
+  when: not gitlab_file.stat.exists
+  register: gitlab_install
+  notify:
+    - reconfigure gitlab
+
+- name: Create GitLab SSL configuration folder.
+  file:
+    path: /etc/gitlab/ssl
+    state: directory
+    mode: 0755
+  when: gitlab_create_self_signed_cert
+
+- name: Create openssl private key
+  openssl_privatekey:
+    path: "{{ gitlab_ssl_certificate_key }}"
+    size: 2048
+  when: gitlab_create_self_signed_cert
+
+- name: Create openssl Certificate Signing Request (CSR)
+  openssl_csr:
+    path: "{{ gitlab_ssl_certificate_csr }}"
+    privatekey_path: "{{ gitlab_ssl_certificate_key }}"
+    organization_name: "{{ gitlab_ssl_certificate_organization_name }}"
+    email_address: "{{ gitlab_ssl_certificate_email_address }}"
+    common_name: "{{ gitlab_domain }}"
+    subject_alt_name: "{{ gitlab_ssl_subject_alt_name }}"
+  when: gitlab_create_self_signed_cert
+
+- name: Create openssl certificate
+  openssl_certificate:
+    path: "{{ gitlab_ssl_certificate }}"
+    privatekey_path: "{{ gitlab_ssl_certificate_key }}"
+    csr_path: "{{ gitlab_ssl_certificate_csr }}"
+    ownca_path: "{{gitlab_ca_ssl_certificate_path}}"
+    ownca_privatekey_path: "{{gitlab_ca_ssl_certificate_privatekey_path}}"
+    ownca_privatekey_passphrase: "{{gitlab_ca_ssl_certificate_passphrase}}"
+    provider: "{{'ownca' if (gitlab_ca_ssl_certificate) else 'selfsigned'}}"
+  when: gitlab_create_self_signed_cert
+  register: gitlab_certificate
+  notify:
+    - restart gitlab
+
+- name: Copy GitLab configuration file.
+  template:
+    src: "{{ gitlab_config_template }}"
+    dest: /etc/gitlab/gitlab.rb
+    owner: root
+    group: root
+    mode: 0600
+
+- name: Calculate current gitlab.rb md5
+  stat: path="/etc/gitlab/gitlab.rb"
+  register: curr_config_stat
+
+- name: Check config file gitlab.rb for changes
+  command: test {{ old_config_stat.stat.checksum }} = {{ curr_config_stat.stat.checksum }}
+  changed_when: "config_check.rc != 0"
+  failed_when: config_check.stderr
+  register: config_check
+  when: gitlab_file.stat.exists
+  notify:
+    - reconfigure gitlab
+
+# https://docs.gitlab.com/omnibus/settings/nginx.html#using-a-non-bundled-web-server
+- name: Unbundle Nginx webserver
+  include_tasks: "unbundle_nginx.yml"
+  when: gitlab_nginx_unbundling|bool == True

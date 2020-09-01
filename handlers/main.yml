@@ -1,0 +1,46 @@
+---
+# handlers file for provisioning/roles/gitlab-ce
+
+- name: reload service firewalld
+  systemd:
+    name: firewalld
+    state: reloaded
+    enabled: yes
+
+# Reconfigure GitLab.
+- name: reconfigure gitlab
+  command: gitlab-ctl reconfigure
+  register: gitlab_reconfigure
+  failed_when: 'gitlab_reconfigure.rc != 0'
+  notify:
+    - restart gitlab
+
+# Restart GitLab.
+- name: restart gitlab
+  command: gitlab-ctl restart
+  register: gitlab_restart
+  failed_when: "'nok:' in gitlab_restart.stdout"
+
+- name: reload service nginx
+  systemd:
+    name: nginx
+    state: reloaded
+    enabled: yes
+
+- name: set selinux policy for directories
+  sefcontext:
+   target: '{{ item.target }}(/.*)?'
+   setype: "{{ item.setype }}"
+   reload: True
+   state: present
+  register: filecontext
+  with_items:
+  - { target: '/var/opt/gitlab/gitlab-workhorse/socket', setype: 'httpd_var_run_t' }
+
+- name: run restore context to reload selinux
+  shell: restorecon -R -v {{ item.target }}
+#  when: filecontext.results[item.index].changed|bool
+  with_items:
+  - { index: 0, target: '/var/opt/gitlab/gitlab-workhorse/socket' }
+  notify:
+    - reload service nginx

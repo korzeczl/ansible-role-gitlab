@@ -1,0 +1,100 @@
+- name: Force all notified handlers to run at this point, not waiting for normal sync points
+  meta: flush_handlers
+
+- name: Flag activation for configuration file template modification
+  set_fact:
+    _unbundle_nginx: true
+
+- name: collect facts about system services
+  service_facts:
+  register: services_state
+
+- name: Install Nginx engine
+  yum:
+    name: nginx
+    state: present
+
+- name: Copy nginx configuration file.
+  template:
+    src: "{{ nginx_config_template }}"
+    dest: /etc/nginx/nginx.conf
+    owner: root
+    group: root
+    mode: 0600
+
+- name: Check if Gitlab nginx configuration file already exist.
+  stat: path=/etc/nginx/conf.d/gitlab-omnibus{{ '-ssl' if  gitlab_redirect_http_to_https|bool == True else ''}}-nginx.conf
+  register: gitlab_nginx_conf_file
+
+- name: Download Gitlab nginx configuration file
+  get_url:
+    url: https://gitlab.com/gitlab-org/gitlab-recipes/-/raw/master/web-server/nginx/gitlab-omnibus{{ '-ssl' if  gitlab_redirect_http_to_https|bool == True else ''}}-nginx.conf?inline=false
+    dest: /etc/nginx/conf.d/
+  when: not gitlab_nginx_conf_file.stat.exists
+
+- name: Calculate current gitlab_nginx_conf_file md5
+  stat: path="/etc/nginx/conf.d/gitlab-omnibus{{ '-ssl' if  gitlab_redirect_http_to_https|bool == True else ''}}-nginx.conf"
+  register: curr_nginx_config_stat
+  when: gitlab_nginx_conf_file.stat.exists
+
+- name: Replace FQDN
+  replace:
+    path: /etc/nginx/conf.d/gitlab-omnibus{{ '-ssl' if  gitlab_redirect_http_to_https|bool == True else ''}}-nginx.conf
+    regexp: 'YOUR_SERVER_FQDN'
+    replace: "{{gitlab_domain}}"
+
+- name: Replace location slug
+  replace:
+    path: /etc/nginx/conf.d/gitlab-omnibus{{ '-ssl' if  gitlab_redirect_http_to_https|bool == True else ''}}-nginx.conf
+    regexp: "location .* {"
+    replace: "location /{{gitlab_url_slug}} {"
+
+- name: Replace ssl certificate path
+  replace:
+    path: /etc/nginx/conf.d/gitlab-omnibus{{ '-ssl' if  gitlab_redirect_http_to_https|bool == True else ''}}-nginx.conf
+    regexp: "/etc/nginx/ssl/gitlab.crt"
+    replace: "{{ gitlab_ssl_certificate }}"
+
+- name: Replace ssl key path
+  replace:
+    path: /etc/nginx/conf.d/gitlab-omnibus{{ '-ssl' if  gitlab_redirect_http_to_https|bool == True else ''}}-nginx.conf
+    regexp: "/etc/nginx/ssl/gitlab.key"
+    replace: "{{ gitlab_ssl_certificate_key }}"
+
+- name: Calculate new gitlab_nginx_conf_file md5
+  stat: path="/etc/nginx/conf.d/gitlab-omnibus{{ '-ssl' if  gitlab_redirect_http_to_https|bool == True else ''}}-nginx.conf"
+  register: new_nginx_config_stat
+
+- name: Check nginx config file gitlab_nginx_conf_file for changes
+  command: test {{ curr_nginx_config_stat.stat.checksum }} = {{ new_nginx_config_stat.stat.checksum }}
+  changed_when: "nginx_config_check.rc != 0"
+  failed_when: nginx_config_check.stderr
+  register: nginx_config_check
+  when: gitlab_nginx_conf_file.stat.exists
+
+- name: Copy GitLab configuration file.
+  template:
+    src: "{{ gitlab_config_template }}"
+    dest: /etc/gitlab/gitlab.rb
+    owner: root
+    group: root
+    mode: 0600
+  notify:
+    - reconfigure gitlab
+
+- name: Force all notified handlers to run at this point, not waiting for normal sync points
+  meta: flush_handlers
+
+- name: Notify nginx to restart
+  command: echo "this task will restart the web services"
+  notify:
+    - reload service nginx
+  when: (nginx_config_check.changed) or
+        (not gitlab_nginx_conf_file.stat.exists) or
+        (services_state.ansible_facts.services["nginx.service"].state != 'running')
+
+- name: Notify selinux context change
+  command: echo "this task will fire-up selinux handler"
+  notify:
+    - set selinux policy for directories
+    - run restore context to reload selinux
